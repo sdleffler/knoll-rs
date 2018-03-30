@@ -1,7 +1,7 @@
 use failure::*;
 
 /// Trait for types usable as "machine words" for the VM.
-pub trait Word: Copy + Eq {
+pub trait Word: Default + Copy + Eq + 'static {
     type Err: Fail;
 
     /// Attempt to unpack a "packed" word. This may fail if the word was packed from a raw value,
@@ -19,6 +19,10 @@ pub trait Word: Copy + Eq {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Header {
+    /// A header indicating that the allocation here has been moved to another heap. This header
+    /// also contains the pointer that the allocation was moved to.
+    Moved(usize),
+
     /// An "environment" on the heap, the runtime representation of a lexical environment. It
     /// consists of a pointer to the parent environment, followed by the number of values stored in
     /// the environment, and then that many words where each word is one of said values. If the
@@ -31,6 +35,10 @@ pub enum Header {
 
     /// A closure consists of a pointer to an environment and a "function template", encoded as raw
     /// data. The function template is an index into the program's registry of function templates.
+    ///
+    /// ```
+    /// [Header::Closure, env, template].len() == 3
+    /// ```
     Closure,
 }
 
