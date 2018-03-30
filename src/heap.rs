@@ -8,9 +8,11 @@ pub enum AllocError {
     OutOfMemory,
 }
 
+/// Index of a word on a specific heap.
 #[derive(Debug, Clone, Copy)]
 pub struct Idx(usize);
 
+/// Index of a contiguous range of words on a specific heap.
 #[derive(Debug, Clone, Copy)]
 pub struct Slice {
     start: usize,
@@ -244,6 +246,9 @@ impl<W: Word> Heap<W> {
     }
 
     /// Deep-copy a value from another heap, non-destructively.
+    ///
+    /// On failure due to an allocation error, the value will be partially copied. The heap should
+    /// be collected and then value copying should be re-attempted.
     pub fn copy_value(&mut self, word: W, from: &Heap<W>) -> Result<W, AllocError> {
         self.copy_word(word, from, Link::Nil)
     }
@@ -260,4 +265,9 @@ pub struct MessageHeap<W: Word> {
     index: Vec<W>,
 }
 
-impl<W: Word> ProcessHeap<W> {}
+impl<W: Word> ProcessHeap<W> {
+    /// Extract a single value from a message heap and deep-copy it (if necessary.)
+    pub fn copy_message(&mut self, idx: usize, from: &MessageHeap<W>) -> Result<W, AllocError> {
+        self.heap.copy_value(from.index[idx], &from.heap)
+    }
+}
