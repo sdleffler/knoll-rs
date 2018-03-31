@@ -1,273 +1,106 @@
-use std::ops::{Index, IndexMut};
-
-use word::{Header, Tag, UnpackedWord, Word};
+use std::ops::{Index, IndexMut, Range};
 
 #[derive(Debug, Fail)]
-pub enum AllocError {
+pub enum HeapError {
+    #[fail(display = "no header found for untagged allocation")]
+    Headerless,
+
+    #[fail(display = "access out of bounds")]
+    OutOfBounds,
+
     #[fail(display = "out of memory")]
     OutOfMemory,
 }
 
-/// Index of a word on a specific heap.
-#[derive(Debug, Clone, Copy)]
-pub struct Idx(usize);
+/// Trait for types usable as "machine words" for the VM.
+pub trait Word: Copy + Eq + 'static {
+    fn pack(Unpacked) -> Self;
 
-/// Index of a contiguous range of words on a specific heap.
-#[derive(Debug, Clone, Copy)]
-pub struct Slice {
-    start: usize,
-    len: usize,
+    /// Try to interpret the word as a value.
+    fn value(self) -> Option<Value>;
+
+    /// Try to interpret the word as a header. This might fail in conditions like debug mode, where
+    /// headers are distinguishable from other values.
+    fn header(self) -> Option<Header>;
+
+    /// Try to interpret the word as a raw value. This might fail in conditions like debug mode,
+    /// where raw words are safely encoded and can be detected.
+    fn raw(self) -> Option<u64>;
 }
 
-#[derive(Debug, Clone, Copy)]
-pub struct HeapEnvironment {
-    addr: usize,
-    nlocals: usize,
-}
-
-impl HeapEnvironment {
-    pub fn parent(self) -> Idx {
-        Idx(self.addr + 1)
-    }
-
-    pub fn locals(self) -> Slice {
-        Slice {
-            start: self.addr + 3,
-            len: self.nlocals,
-        }
-    }
-
-    pub fn into_word<W: Word>(self) -> W {
-        W::pack(UnpackedWord::UntaggedPointer(self.addr))
-    }
-}
-
-#[derive(Debug, Clone, Copy)]
-pub struct HeapClosure(usize);
-
-impl HeapClosure {
-    pub fn environment(self) -> Idx {
-        Idx(self.0 + 1)
-    }
-
-    pub fn template(self) -> Idx {
-        Idx(self.0 + 2)
-    }
-
-    pub fn into_word<W: Word>(self) -> W {
-        W::pack(UnpackedWord::UntaggedPointer(self.0))
-    }
-}
-
-#[derive(Debug, Clone, Copy)]
-pub struct HeapCons(usize);
-
-impl HeapCons {
-    pub fn head(self) -> Idx {
-        Idx(self.0 + 0)
-    }
-
-    pub fn tail(self) -> Idx {
-        Idx(self.0 + 1)
-    }
-
-    pub fn into_word<W: Word>(self) -> W {
-        W::pack(UnpackedWord::TaggedPointer(Tag::Cons, self.0))
-    }
-}
-
-#[derive(Debug)]
-pub struct Heap<W: Word> {
-    /// The heap's contents.
-    words: Vec<W>,
-
-    /// Maximum heap size in words.
-    size: usize,
-
-    /// The "top" of the heap, or current allocation pointer.
-    top: usize,
-}
-
-impl<W: Word> Index<Idx> for Heap<W> {
-    type Output = W;
-
-    fn index(&self, idx: Idx) -> &Self::Output {
-        &self.words[idx.0]
-    }
-}
-
-impl<W: Word> IndexMut<Idx> for Heap<W> {
-    fn index_mut(&mut self, idx: Idx) -> &mut Self::Output {
-        &mut self.words[idx.0]
-    }
-}
-
-impl<W: Word> Index<Slice> for Heap<W> {
-    type Output = [W];
-
-    fn index(&self, slice: Slice) -> &Self::Output {
-        &self.words[slice.start..][..slice.len]
-    }
-}
-
-impl<W: Word> IndexMut<Slice> for Heap<W> {
-    fn index_mut(&mut self, slice: Slice) -> &mut Self::Output {
-        &mut self.words[slice.start..][..slice.len]
-    }
-}
-
-impl<W: Word> Heap<W> {
-    /// Create a new heap with the given size.
-    pub fn new(size: usize) -> Self {
-        let mut words = Vec::new();
-        words.resize(size, W::default());
-        Self {
-            words,
-            size,
-            top: 0,
-        }
-    }
-
-    /// Reset the heap. This is very simple; we simply set the allocation pointer to zero.
-    pub fn clear(&mut self) {
-        self.top = 0;
-    }
-
-    /// Allocate a fixed number of words on the heap without tagging, headers, or initialization.
-    pub fn alloc_raw(&mut self, words: usize) -> Result<usize, AllocError> {
-        if self.top + words >= self.size {
-            return Err(AllocError::OutOfMemory);
-        }
-
-        let addr = self.top;
-        self.top += words;
-        Ok(addr)
-    }
-
-    /// Allocate an environment.
-    pub fn alloc_environment(
-        &mut self,
-        parent: W,
-        nlocals: usize,
-    ) -> Result<HeapEnvironment, AllocError> {
-        let addr = self.alloc_raw(3 + nlocals)?;
-        self.words[addr + 0] = W::pack(UnpackedWord::Header(Header::Environment));
-        self.words[addr + 1] = parent;
-        self.words[addr + 2] = W::pack(UnpackedWord::Raw(nlocals as u64));
-        Ok(HeapEnvironment { addr, nlocals })
-    }
-
-    /// Allocate a closure.
-    pub fn alloc_closure(&mut self, env: W, template: usize) -> Result<HeapClosure, AllocError> {
-        let addr = self.alloc_raw(3)?;
-        self.words[addr + 0] = W::pack(UnpackedWord::Header(Header::Closure));
-        self.words[addr + 1] = env;
-        self.words[addr + 2] = W::pack(UnpackedWord::Raw(template as u64));
-        Ok(HeapClosure(addr))
-    }
-
-    /// Allocate a cons cell.
-    pub fn alloc_cons(&mut self) -> Result<HeapCons, AllocError> {
-        Ok(HeapCons(self.alloc_raw(2)?))
-    }
-}
-
-// A key-value map intended for stack storage and implemented as a linked list of pairs.
-// Inefficient and silly.
-#[derive(Debug, Clone, Copy)]
-enum Link<'a, W: Word> {
-    Nil,
-    Cons {
-        old: usize,
-        new: W,
-        next: &'a Link<'a, W>,
-    },
-}
-
-impl<'a, W: Word> Link<'a, W> {
-    fn get(&self, target: usize) -> Option<W> {
-        match *self {
-            Link::Nil => None,
-            Link::Cons { old, new, .. } if old == target => Some(new),
-            Link::Cons { next, .. } => next.get(target),
-        }
-    }
-}
-
-impl<W: Word> Heap<W> {
-    fn copy_tagged(
-        &mut self,
-        tag: Tag,
-        idx: usize,
-        from: &Self,
-        list: Link<W>,
-    ) -> Result<W, AllocError> {
-        match tag {
-            Tag::Cons => {
-                let cons = self.alloc_cons()?;
-                let list = Link::Cons {
-                    old: idx,
-                    new: cons.into_word(),
-                    next: &list,
-                };
-                self[cons.head()] = self.copy_word(from.words[idx + 0], from, list)?;
-                self[cons.tail()] = self.copy_word(from.words[idx + 1], from, list)?;
-                Ok(cons.into_word())
-            }
-        }
-    }
-
-    fn copy_untagged(&mut self, idx: usize, from: &Self, list: Link<W>) -> Result<W, AllocError> {
-        let header = match list.get(idx) {
-            Some(addr) => return Ok(addr),
-            None => match from.words[idx].unpack().unwrap() {
-                UnpackedWord::Header(header) => header,
-                _ => unreachable!(),
-            },
-        };
-
-        match header {
-            Header::Moved(_) => {
-                unreachable!("cannot copy an object which has been previously moved!")
-            }
-            Header::Environment => unreachable!("cannot copy environments!"),
-            Header::Closure => unreachable!("cannot copy closures!"),
-        }
-    }
-
-    fn copy_word(&mut self, word: W, from: &Self, list: Link<W>) -> Result<W, AllocError> {
-        match word.unpack().unwrap() {
-            UnpackedWord::Header(_) => unreachable!("headers are not valid values!"),
-            UnpackedWord::Immediate(_) => Ok(word),
-            UnpackedWord::TaggedPointer(tag, idx) => self.copy_tagged(tag, idx, from, list),
-            UnpackedWord::UntaggedPointer(idx) => self.copy_untagged(idx, from, list),
-            UnpackedWord::Raw(_) => unreachable!("raw words are not valid values!"),
-        }
-    }
-
-    /// Deep-copy a value from another heap, non-destructively.
+/// Tags indicate types of data. They are often found in the form of heap headers, or extracted
+/// from values embedded in pointers.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Tag {
+    /// An "environment" on the heap, the runtime representation of a lexical environment. It
+    /// consists of a pointer to the parent environment, followed by the number of values stored in
+    /// the environment, and then that many words where each word is one of said values. If the
+    /// environment has no pointer, then the parent pointer points back to the environment header.
     ///
-    /// On failure due to an allocation error, the value will be partially copied. The heap should
-    /// be collected and then value copying should be re-attempted.
-    pub fn copy_value(&mut self, word: W, from: &Heap<W>) -> Result<W, AllocError> {
-        self.copy_word(word, from, Link::Nil)
-    }
+    /// ```
+    /// [env, n, w0, w1 ..., wn].len() == n + 3
+    /// ```
+    Environment,
+
+    /// A closure consists of a pointer to an environment and a "function template", encoded as raw
+    /// data. The function template is an index into the program's registry of function templates.
+    ///
+    /// ```
+    /// [env, template].len() == 3
+    /// ```
+    Closure,
+
+    /// A cons-cell consists of two words, representing the head and tail of a linked list. The two
+    /// fields of the cons pair are also often known as "car" and "cdr".
+    Cons,
 }
 
-#[derive(Debug)]
-pub struct ProcessHeap<W: Word> {
-    heap: Heap<W>,
+/// Headers may be found preceding allocations. They provide information on what sort of data
+/// is allocated following them, providing type information to the runtime.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Header {
+    /// A header indicating that the allocation here has been moved to another heap. This header
+    /// also contains the pointer that the allocation was moved to.
+    Moved(usize),
+
+    /// A header indicating the type of an allocation.
+    Tag(Tag),
 }
 
-#[derive(Debug)]
-pub struct MessageHeap<W: Word> {
-    heap: Heap<W>,
-    index: Vec<W>,
+/// Immediate values are values which are stored outside of allocations, for example small
+/// integers and booleans. These types are small enough that they don't need to be boxed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Immediate {
+    Int(i32),
+    Bool(bool),
+    Nil,
 }
 
-impl<W: Word> ProcessHeap<W> {
-    /// Extract a single value from a message heap and deep-copy it (if necessary.)
-    pub fn copy_message(&mut self, idx: usize, from: &MessageHeap<W>) -> Result<W, AllocError> {
-        self.heap.copy_value(from.index[idx], &from.heap)
-    }
+/// A pointer value consists of a tag, providing type information about a boxed value, and of
+/// course the location of the value.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Pointer(pub Option<Tag>, pub usize);
+
+/// "Values" are words which represent runtime values. This is opposed to headers and "raw" words
+/// which represent no structured data.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Value {
+    Immediate(Immediate),
+    Pointer(Pointer),
+}
+
+/// `UnpackedWord` also includes a `Raw` variant; this is because `UnpackedWord` is a valid `Word`
+/// for running the VM with, and without a `Raw` variant `UnpackedWord` represents only valid words
+/// which cannot be interpreted safely as raw data. This also means that when running the VM with
+/// `UnpackedWord`s instead of packed 32-bit or 64-bit words, we can detect misinterpretation of
+/// values as raw data and vice versa.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Unpacked {
+    Value(Value),
+    Header(Header),
+
+    /// A "raw" word is "just data", used for defining builtins and primitives in the VM; for
+    /// example, in an allocated vector, the first word of the allocation might be a raw length.
+    /// This means that it is encoded directly as an integer rather than as an immediate value.
+    Raw(u64),
 }
