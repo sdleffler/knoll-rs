@@ -1,4 +1,4 @@
-use std::{marker::PhantomData, ops::{Index, IndexMut, Range}};
+use std::ops::{Index, IndexMut, Range};
 
 #[derive(Debug, Fail)]
 pub enum HeapError {
@@ -10,13 +10,10 @@ pub enum HeapError {
 
     #[fail(display = "out of memory")]
     OutOfMemory,
-
-    #[fail(display = "attempt to stare into the void")]
-    Cthulhu,
 }
 
 /// Trait for types usable as "machine words" for the VM.
-pub trait Word: Default + Copy + Eq + 'static {
+pub trait Word: Copy + Eq + 'static {
     fn pack(Unpacked) -> Self;
 
     /// Try to interpret the word as a value.
@@ -41,30 +38,20 @@ pub enum Tag {
     /// environment has no pointer, then the parent pointer points back to the environment header.
     ///
     /// ```
-    /// [Tag::Environment, env, n, w0, w1 ..., wn].len() == n + 3
+    /// [env, n, w0, w1 ..., wn].len() == n + 3
     /// ```
-    ///
-    /// Environments contain raw data (the environment length) and thus cannot be headerless.
     Environment,
 
     /// A closure consists of a pointer to an environment and a "function template", encoded as raw
     /// data. The function template is an index into the program's registry of function templates.
     ///
     /// ```
-    /// [Tag::Closure, env, template].len() == 3
+    /// [env, template].len() == 3
     /// ```
-    ///
-    /// Closures contain raw data (the function template) and thus cannot be headerless.
     Closure,
 
     /// A cons-cell consists of two words, representing the head and tail of a linked list. The two
     /// fields of the cons pair are also often known as "car" and "cdr".
-    ///
-    /// ```
-    /// [head, tail].len() == 2
-    /// ```
-    ///
-    /// Cons cells do not contain raw data and are thus stored headerless.
     Cons,
 }
 
@@ -125,176 +112,223 @@ pub struct Heap<W: Word> {
 }
 
 impl<W: Word> Heap<W> {
-    /// Allocate a range of memory, uninitialized. This will add a header if the supplied layout's
-    /// `HEADER` const is `Some`.
-    #[inline]
-    pub fn alloc_raw<L: Layout<W>>(&mut self, mut size: usize) -> Result<Address<W, L>, HeapError> {
-        if L::HEADER.is_some() {
-            size += 1;
-        }
-
-        if size + self.top <= self.words.len() {
-            let mut addr = self.top;
-
-            if let Some(hdr) = L::HEADER {
-                self.words[addr] = W::pack(Unpacked::Header(Header::Tag(hdr)));
-                addr += 1;
-            }
-
-            self.top += size;
-            Ok(Address::from_offset(addr))
+    pub fn bump(&mut self, len: usize) -> Result<usize, HeapError> {
+        if self.top + len <= self.words.len() {
+            let offset = self.top;
+            self.top += len;
+            Ok(offset)
         } else {
             Err(HeapError::OutOfMemory)
         }
     }
 
-    #[inline]
-    pub fn alloc<L>(&mut self) -> Result<Address<W, L>, HeapError>
-    where
-        L: Layout<W, Args = ()>,
-    {
-        L::alloc(self, ())
-    }
-
-    #[inline]
-    pub fn alloc_with<L>(&mut self, args: L::Args) -> Result<Address<W, L>, HeapError>
-    where
-        L: Layout<W>,
-    {
-        L::alloc(self, args)
-    }
-
-    #[inline]
-    pub fn get_mut<'a, L>(
-        &'a mut self,
-        address: Address<W, L>,
-    ) -> Result<<L as Reify<'a, W>>::Reified, HeapError>
-    where
-        L: Layout<W>,
-    {
-        L::reify(self, address.0)
-    }
-
-    #[inline]
     pub fn words(&self) -> &[W] {
         &self.words
     }
 
-    #[inline]
     pub fn words_mut(&mut self) -> &mut [W] {
         &mut self.words
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
-pub struct Address<W: Word, L>(usize, PhantomData<(W, L)>)
-where
-    L: Layout<W>;
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Address(usize);
 
-impl<W: Word, L: Layout<W>> Address<W, L> {
-    #[inline]
-    pub fn offset(self) -> usize {
-        self.0
-    }
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct AddressRange(usize, usize);
 
-    #[inline]
-    pub fn from_offset(offset: usize) -> Self {
-        Address(offset, PhantomData)
-    }
+#[macro_export]
+macro_rules! __layout_offset {
+    (@each $heap:ident $addr:ident => $field:ident: Word) => { { $addr += 1; } };
+    (@each $heap:ident $addr:ident => $field:ident: Raw) => { { $addr += 1; } };
+    (@each $heap:ident $addr:ident => $field:ident: [Word]) => { {
+            $addr += $heap.words().get($addr).unwrap().raw().unwrap() as usize;
+    } };
+    (@each $heap:ident $addr:ident => $field:ident: [Raw]) => { {
+            $addr += $heap.words().get($addr).unwrap().raw().unwrap() as usize;
+    } };
+    ($heap:ident, $addr:ident => $($prev_field:ident: $prev_type:tt)*) => {
+        {
+            #[allow(unused_mut)]
+            let mut addr = $addr;
+            $(__layout_offset!(@each $heap addr => $prev_field: $prev_type);)*
+            addr
+        }
+    };
 }
 
-pub trait Layout<W: Word>: Sized + for<'a> Reify<'a, W> {
-    type Args;
-    const HEADER: Option<Tag>;
-
-    fn alloc(&mut Heap<W>, Self::Args) -> Result<Address<W, Self>, HeapError>;
+#[macro_export]
+macro_rules! __layout_access {
+    ([$($suffix:tt)*] $heap:ident, $addr:ident => $t:ident) => {{
+        interpolate_idents! {
+            $heap
+                .[ words $($suffix)* ]()
+                .[ get $($suffix)* ]($addr)
+                .unwrap()
+        }
+    }};
+    ([$($suffix:tt)*] $heap:ident, $addr:ident => [$t:ident]) => {{
+        let len = $heap.words().get($addr).unwrap().raw().unwrap() as usize;
+        interpolate_idents! {
+            $heap
+                .[ words $($suffix)* ]()
+                .[ get $($suffix)* ]($addr + 1..$addr + 1 + len)
+                .unwrap()
+        }
+    }};
 }
 
-pub trait Reify<'a, W: Word> {
-    type Reified;
+#[macro_export]
+macro_rules! __layout_needs_header {
+    (@check Word) => { false };
+    (@check Raw) => { true };
+    (@check [Word]) => { true };
+    (@check [Raw]) => { true };
 
-    fn reify(&'a mut Heap<W>, usize) -> Result<Self::Reified, HeapError>;
+    ($($type:tt)*) => { { true $(|| __layout_needs_header!(@check $type))* } };
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
-pub struct Environment;
-
-impl<W: Word> Layout<W> for Environment {
-    type Args = usize;
-    const HEADER: Option<Tag> = Some(Tag::Environment);
-
-    #[inline]
-    fn alloc(heap: &mut Heap<W>, n_locals: usize) -> Result<Address<W, Self>, HeapError> {
-        let addr = heap.alloc_raw(2 + n_locals)?;
-        let words = heap.words_mut();
-        let offset = addr.offset();
-        words[offset + 1] = W::pack(Unpacked::Raw(n_locals as u64));
-        Ok(addr)
-    }
+#[macro_export]
+macro_rules! __layout_type {
+    ($var:ident => Word) => {
+        $var
+    };
+    ($var:ident => Raw) => {
+        $var
+    };
+    ($var:ident => [Word]) => {
+        [$var]
+    };
+    ($var:ident => [Raw]) => {
+        [$var]
+    };
 }
 
-impl<'a, W: Word> Reify<'a, W> for Environment {
-    type Reified = (&'a mut W, &'a mut [W]);
+#[macro_export]
+macro_rules! __layout_field {
+    ($name:ident { $($prev_field:ident: $prev_type:tt)* => $field:ident : $type:tt }) => {
+        impl<'a, W: Word> $name<'a, W> {
+            pub fn $field(&'a self) -> &'a __layout_type!(W => $type) {
+                let heap = &*self.heap;
+                let addr = self.offset;
+                __layout_offset!(heap, addr => $($prev_field : $prev_type)*);
+                __layout_access!([] heap, addr => $type)
+            }
 
-    #[inline]
-    fn reify(heap: &'a mut Heap<W>, idx: usize) -> Result<Self::Reified, HeapError> {
-        let words = heap.words_mut();
-        let slice = words.get_mut(idx..).unwrap();
-        let n_locals = slice.get_mut(1).unwrap().raw().unwrap() as usize;
-        let (env, slice) = slice.split_first_mut().unwrap();
-        let locals = slice.get_mut(1..1 + n_locals).unwrap();
-        Ok((env, locals))
-    }
+            interpolate_idents! {
+                pub fn [ $field _mut ] (&'a mut self) -> &'a mut __layout_type!(W => $type) {
+                    let heap = &mut *self.heap;
+                    let addr = self.offset;
+                    __layout_offset!(heap, addr => $($prev_field : $prev_type)*);
+                    __layout_access!([[_mut]] heap, addr => $type)
+                }
+            }
+        }
+    };
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
-pub struct Closure;
-
-impl<W: Word> Layout<W> for Closure {
-    type Args = ();
-    const HEADER: Option<Tag> = Some(Tag::Closure);
-
-    #[inline]
-    fn alloc(heap: &mut Heap<W>, _args: ()) -> Result<Address<W, Self>, HeapError> {
-        heap.alloc_raw(2)
-    }
+#[macro_export]
+macro_rules! __layout_folded_fields {
+    ($name:ident $($fold:tt)*) => {
+        $(__layout_field!($name $fold);)*
+    };
 }
 
-impl<'a, W: Word> Reify<'a, W> for Closure {
-    type Reified = (&'a mut W, &'a mut W);
-
-    #[inline]
-    fn reify(heap: &'a mut Heap<W>, idx: usize) -> Result<Self::Reified, HeapError> {
-        let slice = heap.words_mut().get_mut(idx + 1..).unwrap(); // Skip header.
-        let (environment, slice) = slice.split_first_mut().unwrap();
-        let template = slice.first_mut().unwrap();
-
-        Ok((environment, template))
-    }
+#[macro_export]
+macro_rules! __layout_fold {
+    (@rec $k:tt [$($prev_field:ident : $prev_type:tt)*] [$($agg:tt)*] $field:ident : $type:tt $($rest:tt)*) => {
+        __layout_fold!(@rec
+            $k
+            [$($prev_field: $prev_type)* $field: $type]
+            [$($agg)* { $($prev_field : $prev_type)* => $field : $type }]
+            $($rest)*
+        );
+    };
+    (@rec ($k:ident!($($kargs:tt)*)) [$($field:ident : $type:tt)*] [$($agg:tt)*]) => {
+        $k!($($kargs)* $($agg)*);
+    };
+    ($k:ident!($($kargs:tt)*) $($field:ident : $type:tt)*) => { __layout_fold!(@rec ($k!($($kargs)*)) [] [] $($field : $type)*); };
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
-pub struct Cons;
+#[macro_export]
+macro_rules! __layout_struct {
+    (struct $name:tt { $($field:ident : $type:tt)* }) => {
+        pub struct $name<'a, W: Word> {
+            offset: usize,
+            heap: &'a mut Heap<W>,
+        }
+        
+        __layout_fold!(__layout_folded_fields!($name) $($field : $type)*);
 
-impl<W: Word> Layout<W> for Cons {
-    type Args = ();
-    const HEADER: Option<Tag> = None;
+        impl<'a, W: Word> $name<'a, W> {
+            pub fn as_slice(&'a self) -> &'a [W] {
+                let heap = &*self.heap;
+                let start = self.offset;
+                let end = __layout_offset!(heap, start => $($field : $type)*);
+                heap.words().get(start..end).unwrap()
+            }
 
-    #[inline]
-    fn alloc(heap: &mut Heap<W>, _args: ()) -> Result<Address<W, Self>, HeapError> {
-        heap.alloc_raw(2)
-    }
+            pub fn as_mut_slice(&'a mut self) -> &'a mut [W] {
+                let heap = &mut *self.heap;
+                let start = self.offset;
+                let end = __layout_offset!(heap, start => $($field : $type)*);
+                heap.words_mut().get_mut(start..end).unwrap()
+            }
+        }
+    };
 }
 
-impl<'a, W: Word> Reify<'a, W> for Cons {
-    type Reified = (&'a mut W, &'a mut W);
+#[macro_export]
+macro_rules! __layout_def {
+    (type Tag = $tag:ident; where { $(struct $name:ident $innards:tt)* }) => {
+        pub enum $tag {
+            $($name,)*
+        }
+    };
+}
 
-    #[inline]
-    fn reify(heap: &'a mut Heap<W>, idx: usize) -> Result<Self::Reified, HeapError> {
-        let slice = heap.words_mut().get_mut(idx..).unwrap();
-        let (head, slice) = slice.split_first_mut().unwrap();
-        let tail = slice.first_mut().unwrap();
+#[macro_export]
+macro_rules! __layout_splat_defs {
+    ($(type $foo:ident = $bar:ident;)* where $stuff:tt) => {
+        $(__layout_def!(type $foo = $bar; where $stuff);)*
+    };
+}
 
-        Ok((head, tail))
+#[macro_export]
+macro_rules! layout {
+    ($(type $foo:ident = $bar:ident;)* where { $(struct $name:ident { $($field:ident : $type:tt),* $(,)* })+ }) => {
+        __layout_splat_defs!($(type $foo = $bar;)* where { $(struct $name { $($field : $type)* })* });
+        $(__layout_struct!(struct $name { $($field : $type)* });)*
+    };
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    mod foo {
+        use super::*;
+
+        trace_macros!(true);
+        layout! {
+            type Tag = Tag;
+
+            where {
+                struct Environment {
+                    parent: Word,
+                    locals: [Word],
+                }
+
+                struct Closure {
+                    environment: Word,
+                    template: Raw,
+                }
+
+                struct Cons {
+                    head: Word,
+                    tail: Word,
+                }
+            }
+        }
     }
 }

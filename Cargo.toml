@@ -5,3 +5,4 @@ version = "0.1.0"
 
 [dependencies]
 failure = "0.1.1"
+interpolate_idents = "0.2.4"
