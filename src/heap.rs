@@ -41,16 +41,20 @@ pub enum Tag {
     /// environment has no pointer, then the parent pointer points back to the environment header.
     ///
     /// ```
-    /// [env, n, w0, w1 ..., wn].len() == n + 2
+    /// [Tag::Environment, env, n, w0, w1 ..., wn].len() == n + 3
     /// ```
+    ///
+    /// Environments contain raw data (the environment length) and thus cannot be headerless.
     Environment,
 
     /// A closure consists of a pointer to an environment and a "function template", encoded as raw
     /// data. The function template is an index into the program's registry of function templates.
     ///
     /// ```
-    /// [env, template].len() == 2
+    /// [Tag::Closure, env, template].len() == 3
     /// ```
+    ///
+    /// Closures contain raw data (the function template) and thus cannot be headerless.
     Closure,
 
     /// A cons-cell consists of two words, representing the head and tail of a linked list. The two
@@ -59,6 +63,8 @@ pub enum Tag {
     /// ```
     /// [head, tail].len() == 2
     /// ```
+    ///
+    /// Cons cells do not contain raw data and are thus stored headerless.
     Cons,
 }
 
@@ -119,10 +125,22 @@ pub struct Heap<W: Word> {
 }
 
 impl<W: Word> Heap<W> {
+    /// Allocate a range of memory, uninitialized. This will add a header if the supplied layout's
+    /// `HEADER` const is `Some`.
     #[inline]
-    pub fn alloc_raw<L: Layout<W>>(&mut self, size: usize) -> Result<Address<W, L>, HeapError> {
+    pub fn alloc_raw<L: Layout<W>>(&mut self, mut size: usize) -> Result<Address<W, L>, HeapError> {
+        if L::HEADER.is_some() {
+            size += 1;
+        }
+
         if size + self.top <= self.words.len() {
-            let addr = self.top;
+            let mut addr = self.top;
+
+            if let Some(hdr) = L::HEADER {
+                self.words[addr] = W::pack(Unpacked::Header(Header::Tag(hdr)));
+                addr += 1;
+            }
+
             self.top += size;
             Ok(Address::from_offset(addr))
         } else {
@@ -187,6 +205,7 @@ impl<W: Word, L: Layout<W>> Address<W, L> {
 
 pub trait Layout<W: Word>: Sized + for<'a> Reify<'a, W> {
     type Args;
+    const HEADER: Option<Tag>;
 
     fn alloc(&mut Heap<W>, Self::Args) -> Result<Address<W, Self>, HeapError>;
 }
@@ -202,6 +221,7 @@ pub struct Environment;
 
 impl<W: Word> Layout<W> for Environment {
     type Args = usize;
+    const HEADER: Option<Tag> = Some(Tag::Environment);
 
     #[inline]
     fn alloc(heap: &mut Heap<W>, n_locals: usize) -> Result<Address<W, Self>, HeapError> {
@@ -222,7 +242,7 @@ impl<'a, W: Word> Reify<'a, W> for Environment {
         let slice = words.get_mut(idx..).unwrap();
         let n_locals = slice.get_mut(1).unwrap().raw().unwrap() as usize;
         let (env, slice) = slice.split_first_mut().unwrap();
-        let locals = slice.get_mut(2..2 + n_locals).unwrap();
+        let locals = slice.get_mut(1..1 + n_locals).unwrap();
         Ok((env, locals))
     }
 }
@@ -232,6 +252,7 @@ pub struct Closure;
 
 impl<W: Word> Layout<W> for Closure {
     type Args = ();
+    const HEADER: Option<Tag> = Some(Tag::Closure);
 
     #[inline]
     fn alloc(heap: &mut Heap<W>, _args: ()) -> Result<Address<W, Self>, HeapError> {
@@ -244,7 +265,7 @@ impl<'a, W: Word> Reify<'a, W> for Closure {
 
     #[inline]
     fn reify(heap: &'a mut Heap<W>, idx: usize) -> Result<Self::Reified, HeapError> {
-        let slice = heap.words_mut().get_mut(idx..).unwrap();
+        let slice = heap.words_mut().get_mut(idx + 1..).unwrap(); // Skip header.
         let (environment, slice) = slice.split_first_mut().unwrap();
         let template = slice.first_mut().unwrap();
 
@@ -257,6 +278,7 @@ pub struct Cons;
 
 impl<W: Word> Layout<W> for Cons {
     type Args = ();
+    const HEADER: Option<Tag> = None;
 
     #[inline]
     fn alloc(heap: &mut Heap<W>, _args: ()) -> Result<Address<W, Self>, HeapError> {
@@ -275,10 +297,4 @@ impl<'a, W: Word> Reify<'a, W> for Cons {
 
         Ok((head, tail))
     }
-}
-
-#[derive(Debug, Clone)]
-pub struct MessageHeap<W: Word> {
-    heap: Heap<W>,
-    index: Vec<W>,
 }
