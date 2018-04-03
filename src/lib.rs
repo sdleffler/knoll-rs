@@ -1,4 +1,4 @@
-#![feature(const_fn, plugin, trace_macros)]
+#![feature(const_fn, plugin, log_syntax, trace_macros)]
 #![plugin(interpolate_idents)]
 
 #[macro_use]
